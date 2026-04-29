@@ -1,0 +1,9 @@
+/vendor/
+/node_modules/
+/.env
+/.env.*
+!/.env.example
+/storage/*.key
+*.log
+.DS_Store
+Thumbs.db

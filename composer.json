@@ -1,0 +1,31 @@
+{
+    "name": "kirbygo/ti-ext-square-catalog-sync",
+    "description": "One-way sync from Square Catalog to TastyIgniter menu (Square is source of truth)",
+    "type": "tastyigniter-package",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Kirby Gordon"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "square/square": "^42.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Kirbygo\\SquareCatalogSync\\": "src/"
+        }
+    },
+    "extra": {
+        "tastyigniter-extension": {
+            "code": "kirbygo.squarecatalogsync",
+            "name": "Square Catalog Sync",
+            "description": "Keeps the TastyIgniter menu in sync with Square Catalog. One-way: Square → TastyIgniter.",
+            "icon": "fa fa-rotate",
+            "author": "Kirby Gordon"
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
