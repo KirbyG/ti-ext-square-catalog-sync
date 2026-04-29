@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Kirbygo\SquareCatalogSync\Http\Controllers;
 
 use Igniter\Admin\Classes\AdminController;
+use Igniter\Admin\Facades\Template;
+use Igniter\Admin\Widgets\Form;
 use Kirbygo\SquareCatalogSync\Jobs\SyncSquareCatalog;
 use Kirbygo\SquareCatalogSync\Models\Settings as SettingsModel;
 use Kirbygo\SquareCatalogSync\Models\SyncLog;
@@ -12,35 +14,20 @@ use Kirbygo\SquareCatalogSync\Models\SyncLog;
 /**
  * Admin settings page for Square Catalog Sync.
  *
- * Accessible at: admin/kirbygo/squarecatalogsync/settings
+ * URL: admin/kirbygo/squarecatalogsync/settings
  *
- * Responsibilities:
- *  - Display and save API credentials (access token, location ID, environment,
- *    webhook signature key)
- *  - Show last sync status (time, count, status)
- *  - Offer a "Sync Now" button that dispatches SyncSquareCatalog
- *  - Display the last 20 log entries
+ * Intentionally does NOT use FormController behavior — the system Settings
+ * controller (which we modelled this on) also manages its Form widget directly.
+ * FormController is designed for multi-record CRUD; a single-record settings
+ * page with extra panels (status, log) is cleaner without it.
  */
 class Settings extends AdminController
 {
-    public array $implement = [
-        \Igniter\Admin\Actions\FormController::class,
-    ];
-
-    public array $formConfig = [
-        'name' => 'Square Catalog Sync Settings',
-        'model' => \Kirbygo\SquareCatalogSync\Models\Settings::class,
-        'edit' => [
-            'title' => 'Square Catalog Sync',
-            'redirect' => 'kirbygo/squarecatalogsync/settings',
-            'redirectClose' => 'kirbygo/squarecatalogsync/settings',
-        ],
-        'configFile' => 'settings_form',
-    ];
-
     public ?string $pageTitle = 'Square Catalog Sync';
 
     protected null|string|array $requiredPermissions = 'Kirbygo.SquareCatalogSync.Manage';
+
+    public ?Form $formWidget = null;
 
     // ------------------------------------------------------------------
     // Actions
@@ -48,18 +35,15 @@ class Settings extends AdminController
 
     public function index(): void
     {
-        // Redirect to the edit form (settings are always single-record).
-        redirect()->to(admin_url('kirbygo/squarecatalogsync/settings/edit'))->send();
-    }
+        Template::setTitle($this->pageTitle);
+        Template::setHeading($this->pageTitle);
 
-    public function edit(?int $recordId = null): mixed
-    {
+        $this->initForm();
+
         $this->vars['syncStatus'] = SettingsModel::lastSyncStatus();
-        $this->vars['syncAt'] = SettingsModel::lastSyncAt();
-        $this->vars['syncCount'] = SettingsModel::lastSyncCount();
+        $this->vars['syncAt']     = SettingsModel::lastSyncAt();
+        $this->vars['syncCount']  = SettingsModel::lastSyncCount();
         $this->vars['recentLogs'] = SyncLog::recent(20)->get();
-
-        return $this->asExtension('FormController')->edit($recordId);
     }
 
     // ------------------------------------------------------------------
@@ -67,65 +51,78 @@ class Settings extends AdminController
     // ------------------------------------------------------------------
 
     /**
-     * "Sync Now" button handler — dispatches a background sync job.
+     * Save settings. Secrets (access token, webhook key) are encrypted
+     * before storage; other fields are passed straight through to the
+     * SettingsModel key-value store.
      */
-    public function onSyncNow(): array
+    public function onSave(): mixed
     {
-        if (! SettingsModel::locationId() || ! (new SettingsModel())->accessToken()) {
-            return [
-                '#notification' => $this->makePartial('flash_message', [
-                    'type' => 'danger',
-                    'message' => 'Please save your Square credentials before running a sync.',
-                ]),
-            ];
+        $this->initForm();
+
+        $data = $this->formWidget->getSaveData();
+
+        // Pull secrets out before generic save so they go through encrypt().
+        if (!empty($data['access_token'])) {
+            SettingsModel::storeAccessToken($data['access_token']);
+        }
+        unset($data['access_token']);
+
+        if (!empty($data['webhook_signature_key'])) {
+            SettingsModel::storeWebhookSignatureKey($data['webhook_signature_key']);
+        }
+        unset($data['webhook_signature_key']);
+
+        SettingsModel::set($data);
+
+        flash()->success('Square Catalog Sync settings saved.');
+
+        return $this->refresh();
+    }
+
+    /**
+     * Dispatch a full sync job in the background.
+     */
+    public function onSyncNow(): mixed
+    {
+        if (!SettingsModel::locationId() || !(new SettingsModel())->accessToken()) {
+            flash()->error('Please save your Square credentials before running a sync.');
+
+            return $this->refresh();
         }
 
         SyncSquareCatalog::dispatch();
 
-        flash()->success('Sync job queued. Check the log below for progress.');
+        flash()->success('Sync job queued. Refresh the page in a moment to see progress.');
 
-        return [
-            '#notification' => $this->makePartial('flash_message', [
-                'type' => 'success',
-                'message' => 'Sync job queued.',
-            ]),
-        ];
-    }
-
-    /**
-     * Save settings — wraps the FormController save, plus handles the
-     * plaintext access token → encrypted storage conversion.
-     */
-    public function onSave(): mixed
-    {
-        $post = post();
-
-        // Pull out plaintext secrets before they reach the model's generic setter.
-        if (! empty($post['Settings']['access_token'])) {
-            SettingsModel::storeAccessToken($post['Settings']['access_token']);
-            unset($post['Settings']['access_token']);
-        }
-
-        if (! empty($post['Settings']['webhook_signature_key'])) {
-            SettingsModel::storeWebhookSignatureKey($post['Settings']['webhook_signature_key']);
-            unset($post['Settings']['webhook_signature_key']);
-        }
-
-        request()->merge($post);
-
-        return $this->asExtension('FormController')->onSave();
+        return $this->refresh();
     }
 
     // ------------------------------------------------------------------
-    // Form model override
+    // Internals
     // ------------------------------------------------------------------
 
-    /**
-     * FormController calls this to load the record.
-     * Settings are single-instance, so we always return the singleton.
-     */
-    public function formFindModelObject(mixed $recordId): SettingsModel
+    private function initForm(): void
     {
-        return SettingsModel::instance();
+        $model = SettingsModel::instance();
+
+        // loadConfig resolves 'settings' → resources/models/settings.php
+        // and extracts the 'form' key from it.
+        $fieldConfig = $model->loadConfig(
+            $model->settingsFieldsConfig,
+            ['form'],
+            'form',
+        );
+
+        $formConfig = array_except($fieldConfig, 'toolbar');
+        $formConfig['model']     = $model;
+        $formConfig['data']      = array_undot($model->getFieldValues());
+        $formConfig['alias']     = 'form';
+        $formConfig['arrayName'] = 'Settings';
+        $formConfig['context']   = 'edit';
+
+        /** @var Form $formWidget */
+        $formWidget = $this->makeWidget(Form::class, $formConfig);
+        $formWidget->bindToController();
+        $this->formWidget = $formWidget;
     }
 }
