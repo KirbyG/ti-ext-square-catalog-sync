@@ -115,7 +115,6 @@ class Settings extends AdminController
 
         $formConfig = array_except($fieldConfig, 'toolbar');
         $formConfig['model']     = $model;
-        $formConfig['data']      = array_undot($model->getFieldValues());
         $formConfig['alias']     = 'form';
         $formConfig['arrayName'] = 'Settings';
         $formConfig['context']   = 'edit';
