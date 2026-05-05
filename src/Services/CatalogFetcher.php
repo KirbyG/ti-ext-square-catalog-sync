@@ -4,16 +4,23 @@ declare(strict_types=1);
 
 namespace Kirbygo\SquareCatalogSync\Services;
 
-use Square\Models\CatalogObject;
-use Square\Models\SearchCatalogObjectsRequest;
+use Square\Types\CatalogObject;
+use Square\Catalog\Requests\SearchCatalogObjectsRequest;
+use Square\Catalog\Requests\ListCatalogRequest;
+use Square\Catalog\Requests\BatchGetCatalogObjectsRequest;
+use Square\Exceptions\SquareApiException;
 
 /**
- * Fetches objects from the Square Catalog API.
+ * Fetches objects from the Square Catalog API (SDK v42).
  *
  * Responsibilities:
- *  - Full fetch: all object types, paginated
- *  - Incremental fetch: objects updated since a given catalog version
+ *  - Full fetch: all object types, paginated via search()
+ *  - Incremental fetch: objects updated since a given catalog version via list()
+ *  - Fetch by IDs: used during webhook processing via batchGet()
  *  - No DB writes; returns raw Square SDK model objects
+ *
+ * v42 error handling: methods throw SquareApiException on API errors rather than
+ * returning error objects. Wrap all calls in try/catch.
  */
 class CatalogFetcher
 {
@@ -43,10 +50,11 @@ class CatalogFetcher
      * Returns a generator that yields arrays of CatalogObject.
      *
      * @return \Generator<int, CatalogObject[]>
+     * @throws \RuntimeException on API errors
      */
     public function fetchAll(): \Generator
     {
-        $api = $this->clientFactory->catalog();
+        $api    = $this->clientFactory->catalog();
         $cursor = null;
 
         do {
@@ -59,20 +67,17 @@ class CatalogFetcher
                 $request->setCursor($cursor);
             }
 
-            $response = $api->searchObjects($request);
-
-            if ($response->isError()) {
-                throw new \RuntimeException(
-                    'Square Catalog search failed: ' . $this->formatErrors($response->getErrors())
-                );
+            try {
+                $response = $api->search($request);
+            } catch (SquareApiException $e) {
+                throw new \RuntimeException('Square Catalog search failed: ' . $e->getMessage(), 0, $e);
             }
 
-            $result = $response->getResult();
-            $objects = $result->getObjects() ?? [];
+            $objects = $response->getObjects() ?? [];
+            $cursor  = $response->getCursor();
 
             yield $objects;
 
-            $cursor = $result->getCursor();
         } while ($cursor !== null);
     }
 
@@ -81,46 +86,33 @@ class CatalogFetcher
     // ------------------------------------------------------------------
 
     /**
-     * Fetch objects updated since $afterVersion (Square catalog version token).
+     * Fetch objects updated since $afterVersion (Square catalog version integer).
      * Returns a generator that yields arrays of CatalogObject (including deleted ones).
      *
+     * Uses list() which supports catalog_version filtering for incremental sync.
+     * The Pager returned by list() handles cursor pagination internally.
+     *
      * @return \Generator<int, CatalogObject[]>
+     * @throws \RuntimeException on API errors
      */
     public function fetchSince(string $afterVersion): \Generator
     {
         $api = $this->clientFactory->catalog();
-        $cursor = null;
 
-        do {
-            $body = ['types' => implode(',', self::OBJECT_TYPES)];
+        $request = new ListCatalogRequest();
+        $request->setTypes(implode(',', self::OBJECT_TYPES));
+        $request->setCatalogVersion((int) $afterVersion);
 
-            if ($cursor) {
-                $body['cursor'] = $cursor;
-            }
+        try {
+            $pager = $api->list($request);
+        } catch (SquareApiException $e) {
+            throw new \RuntimeException('Square Catalog list failed: ' . $e->getMessage(), 0, $e);
+        }
 
-            // listCatalog streams all objects; filter by begin_time isn't available
-            // for version-based sync — we use the catalog version comparison instead.
-            // Square's recommended approach for incremental sync is:
-            // GET /v2/catalog/list?types=...&catalog_version={afterVersion}
-            $response = $api->listCatalog(
-                cursor: $cursor,
-                types: implode(',', self::OBJECT_TYPES),
-                catalogVersion: (int) $afterVersion,
-            );
-
-            if ($response->isError()) {
-                throw new \RuntimeException(
-                    'Square Catalog list failed: ' . $this->formatErrors($response->getErrors())
-                );
-            }
-
-            $result = $response->getResult();
-            $objects = $result->getObjects() ?? [];
-
-            yield $objects;
-
-            $cursor = $result->getCursor();
-        } while ($cursor !== null);
+        // Pager::getPages() yields Page objects; each Page::getItems() is CatalogObject[]
+        foreach ($pager->getPages() as $page) {
+            yield $page->getItems();
+        }
     }
 
     // ------------------------------------------------------------------
@@ -130,6 +122,7 @@ class CatalogFetcher
     /**
      * @param  string[]  $ids
      * @return CatalogObject[]
+     * @throws \RuntimeException on API errors
      */
     public function fetchByIds(array $ids): array
     {
@@ -138,28 +131,15 @@ class CatalogFetcher
         }
 
         $api = $this->clientFactory->catalog();
-        $response = $api->batchRetrieveCatalogObjects(
-            new \Square\Models\BatchRetrieveCatalogObjectsRequest($ids)
-        );
 
-        if ($response->isError()) {
-            throw new \RuntimeException(
-                'Square batch retrieve failed: ' . $this->formatErrors($response->getErrors())
-            );
+        $request = new BatchGetCatalogObjectsRequest(objectIds: $ids);
+
+        try {
+            $response = $api->batchGet($request);
+        } catch (SquareApiException $e) {
+            throw new \RuntimeException('Square batch retrieve failed: ' . $e->getMessage(), 0, $e);
         }
 
-        return $response->getResult()->getObjects() ?? [];
-    }
-
-    // ------------------------------------------------------------------
-    // Helpers
-    // ------------------------------------------------------------------
-
-    private function formatErrors(array $errors): string
-    {
-        return implode('; ', array_map(
-            fn($e) => "[{$e->getCategory()}:{$e->getCode()}] {$e->getDetail()}",
-            $errors
-        ));
+        return $response->getObjects() ?? [];
     }
 }

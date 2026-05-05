@@ -15,9 +15,12 @@ use Illuminate\Support\Facades\Schema;
  */
 return new class extends Migration
 {
-    /** Tables that receive square_object_id + soft-delete columns */
+    /**
+     * Tables that receive square_object_id + soft-delete columns.
+     * 'taxes' is excluded — TastyIgniter stores a single global tax rate in
+     * the settings table, not per-row. Square taxes are logged but not synced.
+     */
     private array $tables = [
-        'taxes',
         'categories',
         'menus',
         'menu_options',

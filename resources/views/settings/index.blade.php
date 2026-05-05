@@ -1,29 +1,15 @@
-@extends('igniter.admin::layouts.default')
+<div class="d-flex p-3">
+    <h4 class="page-title mb-0 lh-base">
+        <span>{!! \Igniter\Admin\Facades\Template::getHeading() !!}</span>
+    </h4>
+</div>
 
-@section('toolbar')
-    <div class="toolbar-action">
-        <button
-            class="btn btn-primary"
-            data-request="onSave"
-            data-progress-indicator="Saving&hellip;"
-        >Save Settings</button>
-
-        <button
-            class="btn btn-default ms-2"
-            data-request="onSyncNow"
-            data-request-confirm="Queue a full sync from Square? Existing items will be upserted."
-            data-progress-indicator="Queueing&hellip;"
-        ><i class="fa fa-rotate me-1"></i>Sync Now</button>
-    </div>
-@endsection
-
-@section('content')
 <div class="container-fluid">
 
-    {{-- Sync status card --}}
+    {{-- Sync status --}}
     <div class="row mb-4">
         <div class="col-12">
-            <div class="card">
+            <div class="card shadow-sm">
                 <div class="card-header fw-semibold">Sync Status</div>
                 <div class="card-body">
                     <dl class="row mb-0">
@@ -40,7 +26,7 @@
                                     default   => 'secondary',
                                 };
                             @endphp
-                            <span class="badge bg-{{ $badge }}">{{ ucfirst($syncStatus) }}</span>
+                            <span class="badge bg-{{ $badge }}">{{ ucfirst($syncStatus ?? 'never') }}</span>
                         </dd>
 
                         <dt class="col-sm-3">Items synced</dt>
@@ -54,13 +40,24 @@
     {{-- Settings form --}}
     <div class="row mb-4">
         <div class="col-12">
-            <div class="card">
-                <div class="card-header fw-semibold">Connection Settings</div>
-                <div class="card-body">
-                    {!! form_open(['id' => 'squaresync-settings-form', 'role' => 'form', 'method' => 'POST']) !!}
-                    @formWidget($formWidget)
-                    {!! form_close() !!}
+            <div class="card shadow-sm">
+                <div class="border-bottom p-2 d-flex gap-2">
+                    <button
+                        class="btn btn-primary btn-sm"
+                        data-request="onSave"
+                        data-progress-indicator="Saving&hellip;"
+                    >Save Settings</button>
+
+                    <button
+                        class="btn btn-default btn-sm"
+                        data-request="onSyncNow"
+                        data-request-confirm="Queue a full sync from Square? Existing items will be upserted."
+                        data-progress-indicator="Queueing&hellip;"
+                    ><i class="fa fa-rotate me-1"></i>Sync Now</button>
                 </div>
+                {!! form_open(current_url(), ['id' => 'squaresync-settings-form', 'role' => 'form', 'method' => 'POST']) !!}
+                {!! $this->formWidget->render() !!}
+                {!! form_close() !!}
             </div>
         </div>
     </div>
@@ -68,7 +65,7 @@
     {{-- Recent log --}}
     <div class="row">
         <div class="col-12">
-            <div class="card">
+            <div class="card shadow-sm">
                 <div class="card-header fw-semibold">
                     Recent Log <small class="text-muted fw-normal">(last 20 entries)</small>
                 </div>
@@ -117,4 +114,3 @@
     </div>
 
 </div>
-@endsection

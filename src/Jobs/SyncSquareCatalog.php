@@ -77,29 +77,38 @@ class SyncSquareCatalog implements ShouldQueue
 
     private function runSync(CatalogFetcher $fetcher, CatalogMapper $mapper): void
     {
-        if ($this->afterVersion) {
-            // Incremental: only objects changed since $afterVersion
-            foreach ($fetcher->fetchSince($this->afterVersion) as $objects) {
-                foreach ($objects as $object) {
-                    $mapper->upsert($object);
-                }
-            }
+        $generator = $this->afterVersion
+            ? $fetcher->fetchSince($this->afterVersion)
+            : $fetcher->fetchAll();
 
-            // Bump last known version
-            // Square doesn't return the new version in listCatalog; the new version
-            // comes from the webhook event or can be obtained via retrieveCatalogInfo.
-            // We'll store the afterVersion + 1 as a conservative step; the next
-            // webhook or cron run will correct it via the new event version.
+        // Buffer all pages so we can do a two-pass upsert:
+        // Pass 1 — foundational types (categories, modifier lists, modifiers)
+        // Pass 2 — items (which depend on categories and modifier lists existing)
+        // Without this, items processed before their categories miss the pivot rows.
+        $allObjects = [];
+        foreach ($generator as $page) {
+            foreach ($page as $obj) {
+                $allObjects[] = $obj;
+            }
+        }
+
+        // Pass 1: everything except ITEM
+        foreach ($allObjects as $obj) {
+            if ($obj->getType() !== 'ITEM') {
+                $mapper->upsert($obj);
+            }
+        }
+
+        // Pass 2: items (categories and modifier lists are now in the DB)
+        foreach ($allObjects as $obj) {
+            if ($obj->getType() === 'ITEM') {
+                $mapper->upsert($obj);
+            }
+        }
+
+        if ($this->afterVersion) {
             Settings::setLastSyncVersion((string) ((int) $this->afterVersion + 1));
         } else {
-            // Full sync
-            foreach ($fetcher->fetchAll() as $objects) {
-                foreach ($objects as $object) {
-                    $mapper->upsert($object);
-                }
-            }
-
-            // Record the current catalog version after a full sync
             Settings::setLastSyncVersion((string) time());
         }
     }

@@ -5,7 +5,8 @@
     "license": "MIT",
     "authors": [
         {
-            "name": "Kirby Gordon"
+            "name": "Kirby Gordon",
+            "email": "kirbyjgordon@gmail.com"
         }
     ],
     "require": {
