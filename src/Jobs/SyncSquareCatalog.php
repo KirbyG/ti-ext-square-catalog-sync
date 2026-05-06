@@ -83,10 +83,10 @@ class SyncSquareCatalog implements ShouldQueue
             ? $fetcher->fetchSince($this->afterVersion)
             : $fetcher->fetchAll();
 
-        // Buffer all pages so we can do a two-pass upsert:
-        // Pass 1 — foundational types (categories, modifier lists, modifiers)
-        // Pass 2 — items (which depend on categories and modifier lists existing)
-        // Without this, items processed before their categories miss the pivot rows.
+        // Buffer all pages so we can do a multi-pass upsert:
+        // Pass 1 — categories (MENU_CATEGORY only, parent-first order, fixTree at end)
+        // Pass 2 — other foundational types (modifier lists, modifiers, images, taxes)
+        // Pass 3 — items (depend on categories and modifier lists existing)
         $allObjects = [];
         foreach ($generator as $page) {
             foreach ($page as $obj) {
@@ -94,14 +94,20 @@ class SyncSquareCatalog implements ShouldQueue
             }
         }
 
-        // Pass 1: everything except ITEM
+        // Pass 1: categories — batch method handles parent ordering and fixTree()
+        $mapper->upsertCategories(array_values(array_filter(
+            $allObjects,
+            fn ($o) => $o->getType() === 'CATEGORY',
+        )));
+
+        // Pass 2: everything except CATEGORY and ITEM
         foreach ($allObjects as $obj) {
-            if ($obj->getType() !== 'ITEM') {
+            if ($obj->getType() !== 'CATEGORY' && $obj->getType() !== 'ITEM') {
                 $mapper->upsert($obj);
             }
         }
 
-        // Pass 2: items (categories and modifier lists are now in the DB)
+        // Pass 3: items (categories and modifier lists are now in the DB)
         foreach ($allObjects as $obj) {
             if ($obj->getType() === 'ITEM') {
                 $mapper->upsert($obj);

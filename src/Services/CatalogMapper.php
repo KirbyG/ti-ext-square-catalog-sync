@@ -25,7 +25,8 @@ use Square\Types\CatalogObjectImage;
  *   - getValue() → typed wrapper (CatalogObjectItem, CatalogObjectTax, etc.)
  *
  * TastyIgniter schema notes (verified against actual DB):
- *   - categories          → category_id (PK), name, status
+ *   - categories          → category_id (PK), name, parent_id, status, nest_left, nest_right
+ *                           Uses kalnoy/nestedset; call Category::fixTree() after batch writes.
  *   - menu_categories     → menu_id, category_id  (pivot; menus has NO category_id column)
  *   - menus               → menu_id (PK), menu_name, menu_description, menu_price, menu_status
  *   - menu_options        → option_id (PK), option_name, display_type  (no status column)
@@ -36,6 +37,11 @@ use Square\Types\CatalogObjectImage;
  *
  * Each upsert method is idempotent: running it twice produces the same result.
  * Rows are matched by square_object_id; soft-deleted when Square marks is_deleted.
+ *
+ * Category sync uses MENU_CATEGORY objects only (Square's POS/online menu hierarchy).
+ * REGULAR_CATEGORY and KITCHEN_CATEGORY are skipped — they are legacy accounting/POS tags.
+ * SyncSquareCatalog calls upsertCategories() with all CATEGORY objects before items so
+ * parent IDs can be resolved; after the batch Category::fixTree() rebuilds nest_left/nest_right.
  *
  * IMAGE objects are processed before ITEM objects (enforced by SyncSquareCatalog's
  * two-pass approach), so $imageLibrary is always populated before syncItemImages runs.
@@ -113,27 +119,111 @@ class CatalogMapper
     // Categories → categories table
     // ------------------------------------------------------------------
 
-    private function upsertCategory(CatalogObjectCategory $wrapper): void
+    /**
+     * Batch-upsert all MENU_CATEGORY objects from a sync page collection.
+     * Runs multi-pass so parents are always written before their children,
+     * regardless of the order Square returns them.
+     * Calls Category::fixTree() at the end to rebuild nest_left/nest_right.
+     *
+     * @param  CatalogObject[]  $categoryObjects  All objects whose getType() === 'CATEGORY'
+     */
+    public function upsertCategories(array $categoryObjects): void
     {
-        $data = $wrapper->getCategoryData();
-        if (! $data) {
+        // Index MENU_CATEGORY objects by Square ID
+        $byId = [];
+        foreach ($categoryObjects as $obj) {
+            $wrapper = $obj->getValue();
+            $data    = $wrapper->getCategoryData();
+            if ($data?->getCategoryType() !== 'MENU_CATEGORY') {
+                continue;
+            }
+            $byId[$wrapper->getId()] = $obj;
+        }
+
+        if (empty($byId)) {
             return;
         }
+
+        // Multi-pass: each pass writes rows whose parent is already committed.
+        // Handles arbitrary nesting depth; 5 passes covers any realistic menu tree.
+        $processed = [];
+        $remaining = $byId;
+
+        for ($pass = 0; $pass < 5 && ! empty($remaining); $pass++) {
+            foreach ($remaining as $squareId => $obj) {
+                $wrapper  = $obj->getValue();
+                $data     = $wrapper->getCategoryData();
+                $parentSquareId = $data->getParentCategory()?->getId();
+
+                if ($parentSquareId !== null && ! isset($processed[$parentSquareId])) {
+                    continue; // Parent not yet written — defer to next pass
+                }
+
+                $parentTiId = $parentSquareId
+                    ? DB::table('categories')->where('square_object_id', $parentSquareId)->value('category_id')
+                    : null;
+
+                DB::table('categories')->upsert(
+                    [
+                        'square_object_id' => $squareId,
+                        'name'             => $data->getName() ?? 'Unnamed Category',
+                        'description'      => '',
+                        'parent_id'        => $parentTiId,
+                        'status'           => 1,
+                        'priority'         => 0,
+                        'updated_at'       => now(),
+                    ],
+                    uniqueBy: ['square_object_id'],
+                    update: ['name', 'parent_id', 'status', 'updated_at'],
+                );
+
+                $processed[$squareId] = true;
+                unset($remaining[$squareId]);
+                $this->upsertCount++;
+            }
+        }
+
+        if (! empty($remaining)) {
+            SyncLog::warning('Some categories could not be resolved after 5 passes', [
+                'unresolved_square_ids' => array_keys($remaining),
+            ]);
+        }
+
+        // Rebuild the nested set (nest_left / nest_right) from parent_id values.
+        // Must be called after all category rows are committed.
+        \Igniter\Cart\Models\Category::fixTree();
+    }
+
+    private function upsertCategory(CatalogObjectCategory $wrapper): void
+    {
+        // Called from upsert() for individual objects (e.g. incremental webhook syncs).
+        // Skips non-MENU_CATEGORY types; parent_id resolution is best-effort here
+        // (parent may not exist yet for out-of-order incremental events).
+        $data = $wrapper->getCategoryData();
+        if (! $data || $data->getCategoryType() !== 'MENU_CATEGORY') {
+            return;
+        }
+
+        $parentSquareId = $data->getParentCategory()?->getId();
+        $parentTiId     = $parentSquareId
+            ? DB::table('categories')->where('square_object_id', $parentSquareId)->value('category_id')
+            : null;
 
         DB::table('categories')->upsert(
             [
                 'square_object_id' => $wrapper->getId(),
                 'name'             => $data->getName() ?? 'Unnamed Category',
                 'description'      => '',
+                'parent_id'        => $parentTiId,
                 'status'           => 1,
                 'priority'         => 0,
                 'updated_at'       => now(),
             ],
             uniqueBy: ['square_object_id'],
-            // 'status' included so a re-enabled category gets reactivated on re-sync
-            update: ['name', 'status', 'updated_at'],
+            update: ['name', 'parent_id', 'status', 'updated_at'],
         );
 
+        \Igniter\Cart\Models\Category::fixTree();
         $this->upsertCount++;
     }
 
