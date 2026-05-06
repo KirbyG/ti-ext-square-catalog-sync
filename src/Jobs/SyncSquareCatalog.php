@@ -114,6 +114,11 @@ class SyncSquareCatalog implements ShouldQueue
             }
         }
 
+        // Pass 4: deactivate items whose Square-synced categories are all inactive.
+        // Handles category-level channel restrictions (e.g. a POS-only section whose
+        // items still carry the online channel individually).
+        $mapper->deactivateItemsInInactiveCategories();
+
         if ($this->afterVersion) {
             Settings::setLastSyncVersion((string) ((int) $this->afterVersion + 1));
         } else {

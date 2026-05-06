@@ -177,13 +177,24 @@ class CatalogMapper
                     ? DB::table('categories')->where('square_object_id', $parentSquareId)->value('category_id')
                     : null;
 
+                // A category is online-visible unless:
+                //   (a) onlineVisibility is explicitly false, or
+                //   (b) a specific channel list is set and the ordering channel is absent.
+                $catChannels = $data->getChannels() ?? [];
+                $catStatus   = ($data->getOnlineVisibility() === false)
+                    ? 0
+                    : ($this->orderingChannelId !== null && ! empty($catChannels)
+                        && ! in_array($this->orderingChannelId, $catChannels, true)
+                        ? 0
+                        : 1);
+
                 DB::table('categories')->upsert(
                     [
                         'square_object_id' => $squareId,
                         'name'             => $data->getName() ?? 'Unnamed Category',
                         'description'      => '',
                         'parent_id'        => $parentTiId,
-                        'status'           => 1,
+                        'status'           => $catStatus,
                         'priority'         => $priorities[$squareId],
                         'updated_at'       => now(),
                     ],
@@ -765,6 +776,49 @@ class CatalogMapper
             ->update($updates);
 
         SyncLog::info("Soft-deleted {$type}", ['square_id' => $id]);
+    }
+
+    // ------------------------------------------------------------------
+    // Post-sync cleanup
+    // ------------------------------------------------------------------
+
+    /**
+     * Deactivate menu items whose Square-synced categories are all inactive.
+     * Called once after the full item pass so that items in POS-only category
+     * trees (status=0) are also hidden from the storefront.
+     * Items belonging to at least one active category are left as-is.
+     */
+    public function deactivateItemsInInactiveCategories(): void
+    {
+        // Find menu IDs that ONLY link to inactive Square-synced categories.
+        // Menus with at least one active-category link are excluded.
+        DB::statement("
+            UPDATE menus
+            SET    menu_status = 0,
+                   updated_at  = NOW()
+            WHERE  menu_id IN (
+                       SELECT mc.menu_id
+                       FROM   menu_categories mc
+                       JOIN   categories c ON c.category_id = mc.category_id
+                       WHERE  c.status = 0
+                         AND  c.square_object_id IS NOT NULL
+                   )
+              AND  menu_id NOT IN (
+                       SELECT mc.menu_id
+                       FROM   menu_categories mc
+                       JOIN   categories c ON c.category_id = mc.category_id
+                       WHERE  c.status = 1
+                   )
+              AND  square_object_id IS NOT NULL
+        ");
+
+        // Remove pivot rows for those now-inactive items
+        DB::statement("
+            DELETE mc FROM menu_categories mc
+            JOIN   menus m ON m.menu_id = mc.menu_id
+            WHERE  m.menu_status = 0
+              AND  m.square_object_id IS NOT NULL
+        ");
     }
 
     // ------------------------------------------------------------------
