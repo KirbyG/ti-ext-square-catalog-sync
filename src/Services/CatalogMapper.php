@@ -129,7 +129,9 @@ class CatalogMapper
      */
     public function upsertCategories(array $categoryObjects): void
     {
-        // Index MENU_CATEGORY objects by Square ID
+        // Index MENU_CATEGORY objects by Square ID, preserving API response order.
+        // The Square API returns categories in the same order as the Dashboard,
+        // so API position is used as the priority within each sibling group.
         $byId = [];
         foreach ($categoryObjects as $obj) {
             $wrapper = $obj->getValue();
@@ -144,6 +146,17 @@ class CatalogMapper
             return;
         }
 
+        // Pre-compute sibling position (priority) for each category.
+        // Group by parent Square ID, then assign position * 10 within each group.
+        $siblingCounters = [];
+        $priorities      = [];
+        foreach ($byId as $squareId => $obj) {
+            $parentKey = $obj->getValue()->getCategoryData()->getParentCategory()?->getId() ?? '__root__';
+            $siblingCounters[$parentKey] = ($siblingCounters[$parentKey] ?? 0);
+            $priorities[$squareId]       = $siblingCounters[$parentKey];
+            $siblingCounters[$parentKey] += 10;
+        }
+
         // Multi-pass: each pass writes rows whose parent is already committed.
         // Handles arbitrary nesting depth; 5 passes covers any realistic menu tree.
         $processed = [];
@@ -151,8 +164,8 @@ class CatalogMapper
 
         for ($pass = 0; $pass < 5 && ! empty($remaining); $pass++) {
             foreach ($remaining as $squareId => $obj) {
-                $wrapper  = $obj->getValue();
-                $data     = $wrapper->getCategoryData();
+                $wrapper        = $obj->getValue();
+                $data           = $wrapper->getCategoryData();
                 $parentSquareId = $data->getParentCategory()?->getId();
 
                 if ($parentSquareId !== null && ! isset($processed[$parentSquareId])) {
@@ -170,11 +183,11 @@ class CatalogMapper
                         'description'      => '',
                         'parent_id'        => $parentTiId,
                         'status'           => 1,
-                        'priority'         => 0,
+                        'priority'         => $priorities[$squareId],
                         'updated_at'       => now(),
                     ],
                     uniqueBy: ['square_object_id'],
-                    update: ['name', 'parent_id', 'status', 'updated_at'],
+                    update: ['name', 'parent_id', 'status', 'priority', 'updated_at'],
                 );
 
                 $processed[$squareId] = true;
