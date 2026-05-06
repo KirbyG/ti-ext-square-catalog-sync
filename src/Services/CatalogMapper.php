@@ -189,6 +189,16 @@ class CatalogMapper
             ]);
         }
 
+        // Deactivate any Square-synced category NOT in the MENU_CATEGORY set.
+        // This removes old REGULAR_CATEGORY rows written by earlier sync versions
+        // and any categories deleted from the Square menu hierarchy.
+        if (! empty($processed)) {
+            DB::table('categories')
+                ->whereNotNull('square_object_id')
+                ->whereNotIn('square_object_id', array_keys($processed))
+                ->update(['status' => 0, 'updated_at' => now()]);
+        }
+
         // Rebuild the nested set (nest_left / nest_right) from parent_id values.
         // Must be called after all category rows are committed.
         \Igniter\Cart\Models\Category::fixTree();
