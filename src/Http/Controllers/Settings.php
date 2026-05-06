@@ -10,6 +10,7 @@ use Igniter\Admin\Widgets\Form;
 use Kirbygo\SquareCatalogSync\Jobs\SyncSquareCatalog;
 use Kirbygo\SquareCatalogSync\Models\Settings as SettingsModel;
 use Kirbygo\SquareCatalogSync\Models\SyncLog;
+use Kirbygo\SquareCatalogSync\Services\CatalogFetcher;
 
 /**
  * Admin settings page for Square Catalog Sync.
@@ -77,6 +78,42 @@ class Settings extends AdminController
         flash()->success('Square Catalog Sync settings saved.');
 
         return $this->refresh();
+    }
+
+    /**
+     * Scan all Square ITEM objects and return a channel-frequency table.
+     * The channel with the fewest items is almost always the online-ordering channel.
+     * Results are injected into #channels-result in the view.
+     */
+    public function onDetectChannels(): mixed
+    {
+        if (!(new SettingsModel())->accessToken()) {
+            flash()->error('Save your Square credentials before scanning channels.');
+            return $this->refresh();
+        }
+
+        $fetcher       = app(CatalogFetcher::class);
+        $channelCounts = [];
+        $itemsScanned  = 0;
+
+        foreach ($fetcher->fetchAllItems() as $page) {
+            foreach ($page as $obj) {
+                $data = $obj->getValue()->getItemData();
+                foreach ($data?->getChannels() ?? [] as $channelId) {
+                    $channelCounts[$channelId] = ($channelCounts[$channelId] ?? 0) + 1;
+                }
+                $itemsScanned++;
+            }
+        }
+
+        // Ascending by count — online channel appears on fewer items than universal POS channels
+        asort($channelCounts);
+
+        $this->vars['channelCounts']     = $channelCounts;
+        $this->vars['itemsScanned']      = $itemsScanned;
+        $this->vars['currentChannelId']  = SettingsModel::orderingChannelId();
+
+        return $this->makePartial('settings/channels_detected');
     }
 
     /**

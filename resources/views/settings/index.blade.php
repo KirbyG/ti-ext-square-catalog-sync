@@ -54,11 +54,25 @@
                         data-request-confirm="Queue a full sync from Square? Existing items will be upserted."
                         data-progress-indicator="Queueing&hellip;"
                     ><i class="fa fa-rotate me-1"></i>Sync Now</button>
+
+                    <button
+                        class="btn btn-default btn-sm ms-auto"
+                        data-request="onDetectChannels"
+                        data-request-update="{'settings/channels_detected': '#channels-result'}"
+                        data-progress-indicator="Scanning catalog&hellip;"
+                    ><i class="fa fa-magnifying-glass me-1"></i>Detect Channels</button>
                 </div>
                 {!! form_open(current_url(), ['id' => 'squaresync-settings-form', 'role' => 'form', 'method' => 'POST']) !!}
                 {!! $this->formWidget->render() !!}
                 {!! form_close() !!}
             </div>
+        </div>
+    </div>
+
+    {{-- Channel detection results (populated by onDetectChannels AJAX) --}}
+    <div class="row mb-4">
+        <div id="channels-result" class="col-12">
+            {{-- Populated when "Detect Channels" is clicked --}}
         </div>
     </div>
 
