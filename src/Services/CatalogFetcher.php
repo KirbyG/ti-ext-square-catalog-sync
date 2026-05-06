@@ -60,6 +60,9 @@ class CatalogFetcher
         do {
             $request = new SearchCatalogObjectsRequest();
             $request->setObjectTypes(self::OBJECT_TYPES);
+            // Keep false: IMAGE is already in OBJECT_TYPES so images come back as
+            // top-level objects. includeRelatedObjects(true) would duplicate them
+            // as inline related_objects inside ITEM responses.
             $request->setIncludeRelatedObjects(false);
             $request->setIncludeDeletedObjects(false);
 

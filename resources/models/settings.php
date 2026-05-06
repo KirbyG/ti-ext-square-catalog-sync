@@ -52,6 +52,17 @@ return [
                     'comment' => 'Use Sandbox until the sync is verified end-to-end.',
                 ],
 
+                // ── Sync Options ─────────────────────────────────────────
+
+                'ordering_channel_id' => [
+                    'label'       => 'Ordering Channel ID',
+                    'type'        => 'text',
+                    'tab'         => 'Connection',
+                    'span'        => 'full',
+                    'placeholder' => 'CH_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+                    'comment'     => 'Square Ordering Profile channel ID. Items that lack this channel are set to menu_status = 0 (hidden from online ordering). Leave blank to show all non-archived items.',
+                ],
+
                 // ── Webhook ───────────────────────────────────────────────
 
                 'webhook_signature_key' => [

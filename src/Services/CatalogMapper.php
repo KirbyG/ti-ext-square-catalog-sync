@@ -5,6 +5,9 @@ declare(strict_types=1);
 namespace Kirbygo\SquareCatalogSync\Services;
 
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Storage;
+use Kirbygo\SquareCatalogSync\Models\Settings;
 use Kirbygo\SquareCatalogSync\Models\SyncLog;
 use Square\Types\CatalogObject;
 use Square\Types\CatalogObjectItem;
@@ -25,17 +28,37 @@ use Square\Types\CatalogObjectImage;
  *   - categories          → category_id (PK), name, status
  *   - menu_categories     → menu_id, category_id  (pivot; menus has NO category_id column)
  *   - menus               → menu_id (PK), menu_name, menu_description, menu_price, menu_status
- *   - menu_options        → option_id (PK), option_name, display_type
- *   - menu_option_values  → option_value_id (PK), option_id, name, price
+ *   - menu_options        → option_id (PK), option_name, display_type  (no status column)
+ *   - menu_option_values  → option_value_id (PK), option_id, name, price  (no status column)
  *   - menu_item_options   → menu_option_id (PK), option_id, menu_id, min_selected, max_selected, is_required
+ *   - media_attachments   → polymorphic via attachment_type/attachment_id; tag='thumb' for menu images
  *   - No 'taxes' table — TI stores a single global tax_percentage in settings
  *
  * Each upsert method is idempotent: running it twice produces the same result.
  * Rows are matched by square_object_id; soft-deleted when Square marks is_deleted.
+ *
+ * IMAGE objects are processed before ITEM objects (enforced by SyncSquareCatalog's
+ * two-pass approach), so $imageLibrary is always populated before syncItemImages runs.
  */
 class CatalogMapper
 {
     private int $upsertCount = 0;
+
+    /** Ordering Profile channel ID from settings; null = no channel filter */
+    private readonly ?string $orderingChannelId;
+
+    /**
+     * In-memory map of downloaded images: square_image_id → media row data.
+     * Populated by upsertImage(), consumed by syncItemImages().
+     *
+     * @var array<string, array{disk: string, name: string, file_name: string, mime_type: string, size: int}>
+     */
+    private array $imageLibrary = [];
+
+    public function __construct()
+    {
+        $this->orderingChannelId = Settings::orderingChannelId();
+    }
 
     public function getUpsertCount(): int
     {
@@ -107,7 +130,8 @@ class CatalogMapper
                 'updated_at'       => now(),
             ],
             uniqueBy: ['square_object_id'],
-            update: ['name', 'updated_at'],
+            // 'status' included so a re-enabled category gets reactivated on re-sync
+            update: ['name', 'status', 'updated_at'],
         );
 
         $this->upsertCount++;
@@ -201,6 +225,13 @@ class CatalogMapper
             }
         }
 
+        // Archived items are hidden; items missing the ordering channel are POS-only
+        $isArchived = (bool) $data->getIsArchived();
+        $channels   = $data->getChannels() ?? [];
+        $hasChannel = $this->orderingChannelId === null
+            || in_array($this->orderingChannelId, $channels, true);
+        $menuStatus = ($isArchived || ! $hasChannel) ? 0 : 1;
+
         // menus table has no category_id column; relationship lives in menu_categories pivot
         DB::table('menus')->upsert(
             [
@@ -208,11 +239,11 @@ class CatalogMapper
                 'menu_name'        => $data->getName() ?? 'Unnamed Item',
                 'menu_description' => $data->getDescription() ?? '',
                 'menu_price'       => $masterPrice,
-                'menu_status'      => 1,
+                'menu_status'      => $menuStatus,
                 'updated_at'       => now(),
             ],
             uniqueBy: ['square_object_id'],
-            update: ['menu_name', 'menu_description', 'menu_price', 'updated_at'],
+            update: ['menu_name', 'menu_description', 'menu_price', 'menu_status', 'updated_at'],
         );
 
         $this->upsertCount++;
@@ -226,13 +257,21 @@ class CatalogMapper
         }
 
         if (count($variations) > 1 && $menuId) {
+            $itemName = $data->getName() ?? '';
             foreach ($variations as $variation) {
-                $this->upsertVariation($variation->getValue(), $wrapper->getId());
+                $this->upsertVariation($variation->getValue(), $wrapper->getId(), $itemName);
             }
         }
 
         if ($menuId) {
             $this->syncItemModifierLists($menuId, $wrapper->getId(), $data->getModifierListInfo() ?? []);
+        }
+
+        if ($menuId) {
+            $imageIds = $data->getImageIds() ?? [];
+            if (! empty($imageIds)) {
+                $this->syncItemImages($menuId, $imageIds);
+            }
         }
     }
 
@@ -277,7 +316,7 @@ class CatalogMapper
     /**
      * @param  \Square\Types\CatalogObjectItemVariation  $varWrapper
      */
-    private function upsertVariation(mixed $varWrapper, string $parentItemSquareId): void
+    private function upsertVariation(mixed $varWrapper, string $parentItemSquareId, string $parentItemName = ''): void
     {
         $varData = $varWrapper->getItemVariationData();
         if (! $varData) {
@@ -305,12 +344,22 @@ class CatalogMapper
             ->where('square_object_id', $sizeOptionSquareId)
             ->value('option_id');
 
+        // Strip parent item name prefix that Square often embeds in variation names
+        // e.g. "Earl Grey Decaf, 85 g - 85g" with parent "Earl Grey Decaf, 85 g" → "85g"
+        $rawName = $varData->getName() ?? 'Unnamed';
+        if ($parentItemName !== '' && str_starts_with($rawName, $parentItemName)) {
+            $stripped = ltrim(substr($rawName, strlen($parentItemName)), ' -,');
+            $name     = $stripped ?: $rawName;
+        } else {
+            $name = $rawName;
+        }
+
         // TI column is 'name' (not 'value'); no updated_at column on this table
         DB::table('menu_option_values')->upsert(
             [
                 'square_object_id' => $varWrapper->getId(),
                 'option_id'        => $optionId,
-                'name'             => $varData->getName() ?? 'Unnamed',
+                'name'             => $name,
                 'price'            => $price,
                 'priority'         => 0,
             ],
@@ -368,22 +417,171 @@ class CatalogMapper
     }
 
     // ------------------------------------------------------------------
-    // Images
+    // Images — download Square images into TI media_attachments
     // ------------------------------------------------------------------
 
     private function upsertImage(CatalogObjectImage $wrapper): void
     {
         $data = $wrapper->getImageData();
-        if (! $data?->getUrl()) {
+        $url  = $data?->getUrl();
+        if (! $url) {
             return;
         }
 
-        // TODO: Download image into Igniter media manager, keyed by
-        // square_object_id + getVersion() to avoid re-downloading unchanged images.
-        SyncLog::info('Image sync not yet implemented', [
-            'square_id' => $wrapper->getId(),
-            'url'       => $data->getUrl(),
-        ]);
+        $squareId  = $wrapper->getId();
+        $urlPath   = parse_url($url, PHP_URL_PATH) ?: '';
+        $extension = strtolower(pathinfo($urlPath, PATHINFO_EXTENSION)) ?: 'jpg';
+
+        // Deterministic filename based on Square ID — avoids re-downloading on re-sync
+        $storedName = md5($squareId) . '.' . $extension;
+
+        $diskName      = config('igniter-system.assets.attachment.disk', 'public');
+        $folder        = rtrim((string) config('igniter-system.assets.attachment.folder', 'media/attachments/'), '/');
+        $partitionPath = substr($storedName, 0, 3) . '/' . substr($storedName, 3, 3) . '/' . substr($storedName, 6, 3) . '/';
+        $diskPath      = $folder . '/public/' . $partitionPath . $storedName;
+
+        $disk     = Storage::disk($diskName);
+        $fileSize = 0;
+
+        if (! $disk->exists($diskPath)) {
+            $response = Http::timeout(30)->get($url);
+            if (! $response->successful()) {
+                SyncLog::warning('Failed to download Square image', [
+                    'square_id' => $squareId,
+                    'url'       => $url,
+                    'status'    => $response->status(),
+                ]);
+                return;
+            }
+            $contents = $response->body();
+            $disk->put($diskPath, $contents);
+            $fileSize = strlen($contents);
+        } else {
+            $fileSize = $disk->size($diskPath);
+        }
+
+        $mimeMap  = ['jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'png' => 'image/png', 'gif' => 'image/gif', 'webp' => 'image/webp'];
+        $mimeType = $mimeMap[$extension] ?? 'image/jpeg';
+
+        // Upsert a library row (no attachment) keyed by name for incremental-sync fallback
+        $existing = DB::table('media_attachments')
+            ->where('name', $storedName)
+            ->first();
+
+        if ($existing) {
+            DB::table('media_attachments')
+                ->where('id', $existing->id)
+                ->update(['size' => $fileSize, 'updated_at' => now()]);
+        } else {
+            DB::table('media_attachments')->insert([
+                'disk'              => $diskName,
+                'name'              => $storedName,
+                'file_name'         => 'image.' . $extension,
+                'mime_type'         => $mimeType,
+                'size'              => $fileSize,
+                'tag'               => null,
+                'attachment_type'   => null,
+                'attachment_id'     => null,
+                'is_public'         => 1,
+                'custom_properties' => json_encode(['square_image_id' => $squareId]),
+                'created_at'        => now(),
+                'updated_at'        => now(),
+            ]);
+        }
+
+        $this->imageLibrary[$squareId] = [
+            'disk'      => $diskName,
+            'name'      => $storedName,
+            'file_name' => 'image.' . $extension,
+            'mime_type' => $mimeType,
+            'size'      => $fileSize,
+        ];
+
+        $this->upsertCount++;
+    }
+
+    // ------------------------------------------------------------------
+    // Item ↔ Image associations — media_attachments
+    // ------------------------------------------------------------------
+
+    /**
+     * Replace square-synced media rows for a menu item with the current image set.
+     * Manually uploaded images (no square_image_id in custom_properties) are preserved.
+     *
+     * @param  string[]  $imageIds
+     */
+    private function syncItemImages(int $menuId, array $imageIds): void
+    {
+        // Delete only rows we created (identified by square_image_id in custom_properties)
+        $existing = DB::table('media_attachments')
+            ->where('attachment_type', 'Igniter\Cart\Models\Menu')
+            ->where('attachment_id', $menuId)
+            ->get(['id', 'custom_properties']);
+
+        $squareSyncedIds = $existing
+            ->filter(fn($row) => ! empty(
+                (json_decode($row->custom_properties ?? '{}', true)['square_image_id'] ?? null)
+            ))
+            ->pluck('id');
+
+        if ($squareSyncedIds->isNotEmpty()) {
+            DB::table('media_attachments')->whereIn('id', $squareSyncedIds)->delete();
+        }
+
+        foreach ($imageIds as $imageId) {
+            $img = $this->imageLibrary[$imageId] ?? $this->findLibraryImage($imageId);
+
+            if (! $img) {
+                SyncLog::warning('Image not in library during item sync — run a full sync to download images', [
+                    'square_image_id' => $imageId,
+                    'menu_id'         => $menuId,
+                ]);
+                continue;
+            }
+
+            DB::table('media_attachments')->insert([
+                'disk'              => $img['disk'],
+                'name'              => $img['name'],
+                'file_name'         => $img['file_name'],
+                'mime_type'         => $img['mime_type'],
+                'size'              => $img['size'],
+                'tag'               => 'thumb',
+                'attachment_type'   => 'Igniter\Cart\Models\Menu',
+                'attachment_id'     => $menuId,
+                'is_public'         => 1,
+                'custom_properties' => json_encode(['square_image_id' => $imageId]),
+                'priority'          => 0,
+                'created_at'        => now(),
+                'updated_at'        => now(),
+            ]);
+        }
+    }
+
+    /**
+     * Fallback DB lookup for images not in the in-memory library
+     * (needed during incremental webhook syncs when upsertImage wasn't called).
+     *
+     * @return array{disk: string, name: string, file_name: string, mime_type: string, size: int}|null
+     */
+    private function findLibraryImage(string $squareId): ?array
+    {
+        // Library rows are named md5($squareId).{ext}; query by the md5 prefix
+        $row = DB::table('media_attachments')
+            ->where('name', 'like', md5($squareId) . '.%')
+            ->whereNull('attachment_type')
+            ->first(['disk', 'name', 'file_name', 'mime_type', 'size']);
+
+        if (! $row) {
+            return null;
+        }
+
+        return [
+            'disk'      => $row->disk,
+            'name'      => $row->name,
+            'file_name' => $row->file_name,
+            'mime_type' => $row->mime_type,
+            'size'      => $row->size,
+        ];
     }
 
     // ------------------------------------------------------------------
@@ -393,28 +591,32 @@ class CatalogMapper
     /**
      * Mark rows as deleted when Square returns is_deleted: true.
      * Never hard-deletes — historical orders may reference the row.
+     *
+     * Status column differs per table: menus uses menu_status; menu_options/values
+     * have no status column at all (only deleted_at).
      */
     private function softDelete(string $type, string $id): void
     {
         $tableMap = [
-            'CATEGORY'      => 'categories',
-            'MODIFIER_LIST' => 'menu_options',
-            'MODIFIER'      => 'menu_option_values',
-            'ITEM'          => 'menus',
+            'CATEGORY'      => ['table' => 'categories',        'status_col' => 'status'],
+            'MODIFIER_LIST' => ['table' => 'menu_options',      'status_col' => null],
+            'MODIFIER'      => ['table' => 'menu_option_values', 'status_col' => null],
+            'ITEM'          => ['table' => 'menus',             'status_col' => 'menu_status'],
         ];
 
-        $table = $tableMap[$type] ?? null;
-        if (! $table) {
+        $config = $tableMap[$type] ?? null;
+        if (! $config) {
             return;
         }
 
-        DB::table($table)
+        $updates = ['deleted_at' => now(), 'updated_at' => now()];
+        if ($config['status_col']) {
+            $updates[$config['status_col']] = 0;
+        }
+
+        DB::table($config['table'])
             ->where('square_object_id', $id)
-            ->update([
-                'status'     => 0,
-                'deleted_at' => now(),
-                'updated_at' => now(),
-            ]);
+            ->update($updates);
 
         SyncLog::info("Soft-deleted {$type}", ['square_id' => $id]);
     }

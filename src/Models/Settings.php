@@ -70,6 +70,11 @@ class Settings extends Model
         return static::environment() === 'sandbox';
     }
 
+    public static function orderingChannelId(): ?string
+    {
+        return static::get('ordering_channel_id') ?: null;
+    }
+
     public static function webhookSignatureKey(): ?string
     {
         $encrypted = static::get('webhook_signature_key_encrypted');
