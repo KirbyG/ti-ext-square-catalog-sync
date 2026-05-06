@@ -63,6 +63,14 @@ return [
                     'comment'     => 'Square Ordering Profile channel ID. Items that lack this channel are set to menu_status = 0 (hidden from online ordering). Leave blank to show all non-archived items.',
                 ],
 
+                'excluded_category_ids' => [
+                    'label'   => 'Excluded Category IDs',
+                    'type'    => 'textarea',
+                    'tab'     => 'Connection',
+                    'span'    => 'full',
+                    'comment' => 'Square category IDs (one per line) to exclude from online ordering — e.g. POS-only sections like Drinks. Items whose only categories are excluded will be hidden. Find the ID in Square Dashboard or from the sync logs.',
+                ],
+
                 // ── Webhook ───────────────────────────────────────────────
 
                 'webhook_signature_key' => [

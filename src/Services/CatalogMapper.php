@@ -54,6 +54,9 @@ class CatalogMapper
     /** Ordering Profile channel ID from settings; null = no channel filter */
     private readonly ?string $orderingChannelId;
 
+    /** Square category IDs to treat as POS-only regardless of other flags */
+    private readonly array $excludedCategoryIds;
+
     /**
      * In-memory map of downloaded images: square_image_id → media row data.
      * Populated by upsertImage(), consumed by syncItemImages().
@@ -64,7 +67,8 @@ class CatalogMapper
 
     public function __construct()
     {
-        $this->orderingChannelId = Settings::orderingChannelId();
+        $this->orderingChannelId    = Settings::orderingChannelId();
+        $this->excludedCategoryIds  = Settings::excludedCategoryIds();
     }
 
     public function getUpsertCount(): int
@@ -177,16 +181,15 @@ class CatalogMapper
                     ? DB::table('categories')->where('square_object_id', $parentSquareId)->value('category_id')
                     : null;
 
-                // A category is online-visible unless:
-                //   (a) onlineVisibility is explicitly false, or
-                //   (b) a specific channel list is set and the ordering channel is absent.
-                $catChannels = $data->getChannels() ?? [];
-                $catStatus   = ($data->getOnlineVisibility() === false)
+                // Status 0 if:
+                //   (a) Square explicitly marks the category as hidden online, or
+                //   (b) the admin has listed this Square category ID in excluded_category_ids.
+                // Note: CatalogCategory.channels uses different IDs from item channels
+                // and cannot be compared to the ordering_channel_id setting.
+                $catStatus = ($data->getOnlineVisibility() === false
+                    || in_array($squareId, $this->excludedCategoryIds, true))
                     ? 0
-                    : ($this->orderingChannelId !== null && ! empty($catChannels)
-                        && ! in_array($this->orderingChannelId, $catChannels, true)
-                        ? 0
-                        : 1);
+                    : 1;
 
                 DB::table('categories')->upsert(
                     [

@@ -75,6 +75,22 @@ class Settings extends Model
         return static::get('ordering_channel_id') ?: null;
     }
 
+    /**
+     * Square category IDs (e.g. VZ75ZVESI5GJFT4NSQEHH33R) that should be
+     * treated as POS-only and excluded from the online storefront.
+     * Stored as a newline-separated list in the settings bag.
+     *
+     * @return string[]
+     */
+    public static function excludedCategoryIds(): array
+    {
+        $raw = static::get('excluded_category_ids', '');
+
+        return array_values(array_filter(
+            array_map('trim', preg_split('/[\s,]+/', (string) $raw)),
+        ));
+    }
+
     public static function webhookSignatureKey(): ?string
     {
         $encrypted = static::get('webhook_signature_key_encrypted');
