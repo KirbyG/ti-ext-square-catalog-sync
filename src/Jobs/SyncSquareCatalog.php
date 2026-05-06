@@ -44,6 +44,8 @@ class SyncSquareCatalog implements ShouldQueue
 
     public function handle(CatalogFetcher $fetcher, CatalogMapper $mapper): void
     {
+        ini_set('memory_limit', '512M');
+
         $lock = Cache::lock(self::LOCK_KEY, self::LOCK_TTL);
 
         if (! $lock->get()) {

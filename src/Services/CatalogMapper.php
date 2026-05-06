@@ -444,18 +444,27 @@ class CatalogMapper
         $fileSize = 0;
 
         if (! $disk->exists($diskPath)) {
-            $response = Http::timeout(30)->get($url);
-            if (! $response->successful()) {
-                SyncLog::warning('Failed to download Square image', [
-                    'square_id' => $squareId,
-                    'url'       => $url,
-                    'status'    => $response->status(),
-                ]);
-                return;
+            $tmpFile = tempnam(sys_get_temp_dir(), 'sq_img_');
+            try {
+                // Stream to a temp file — avoids loading the full image body into PHP memory
+                $response = Http::withOptions(['sink' => $tmpFile])->timeout(30)->get($url);
+                if (! $response->successful()) {
+                    SyncLog::warning('Failed to download Square image', [
+                        'square_id' => $squareId,
+                        'url'       => $url,
+                        'status'    => $response->status(),
+                    ]);
+                    return;
+                }
+                $fileSize = (int) filesize($tmpFile);
+                $stream   = fopen($tmpFile, 'rb');
+                $disk->put($diskPath, $stream);
+                if (is_resource($stream)) {
+                    fclose($stream);
+                }
+            } finally {
+                @unlink($tmpFile);
             }
-            $contents = $response->body();
-            $disk->put($diskPath, $contents);
-            $fileSize = strlen($contents);
         } else {
             $fileSize = $disk->size($diskPath);
         }
