@@ -159,15 +159,21 @@ class CatalogMapper
             return;
         }
 
-        // Pre-compute sibling position (priority) for each category.
-        // Group by parent Square ID, then assign position * 10 within each group.
+        // Pre-compute priority for each category.
+        // Use Square's ordinal (display order from Dashboard) when set;
+        // fall back to sibling counter so there are no nulls in the column.
         $siblingCounters = [];
         $priorities      = [];
         foreach ($byId as $squareId => $obj) {
-            $parentKey = $obj->getValue()->getCategoryData()->getParentCategory()?->getId() ?? '__root__';
-            $siblingCounters[$parentKey] = ($siblingCounters[$parentKey] ?? 0);
-            $priorities[$squareId]       = $siblingCounters[$parentKey];
-            $siblingCounters[$parentKey] += 10;
+            $ordinal = $obj->getValue()->getOrdinal();
+            if ($ordinal !== null) {
+                $priorities[$squareId] = $ordinal;
+            } else {
+                $parentKey = $obj->getValue()->getCategoryData()->getParentCategory()?->getId() ?? '__root__';
+                $siblingCounters[$parentKey] = ($siblingCounters[$parentKey] ?? 0);
+                $priorities[$squareId]       = $siblingCounters[$parentKey];
+                $siblingCounters[$parentKey] += 10;
+            }
         }
 
         // Multi-pass: each pass writes rows whose parent is already committed.
