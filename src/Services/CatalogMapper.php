@@ -57,6 +57,9 @@ class CatalogMapper
     /** Square category IDs to treat as POS-only regardless of other flags */
     private readonly array $excludedCategoryIds;
 
+    /** Square item IDs skipped this run (archived or missing ordering channel) */
+    private array $filteredItemIds = [];
+
     /**
      * In-memory map of downloaded images: square_image_id → media row data.
      * Populated by upsertImage(), consumed by syncItemImages().
@@ -74,6 +77,11 @@ class CatalogMapper
     public function getUpsertCount(): int
     {
         return $this->upsertCount;
+    }
+
+    public function getFilteredItemIds(): array
+    {
+        return $this->filteredItemIds;
     }
 
     // ------------------------------------------------------------------
@@ -370,12 +378,17 @@ class CatalogMapper
             }
         }
 
-        // Archived items are hidden; items missing the ordering channel are POS-only
+        // Archived items and items missing the ordering channel are POS-only.
+        // Don't upsert them — track for hard deletion instead.
         $isArchived = (bool) $data->getIsArchived();
         $channels   = $data->getChannels() ?? [];
         $hasChannel = $this->orderingChannelId === null
             || in_array($this->orderingChannelId, $channels, true);
-        $menuStatus = ($isArchived || ! $hasChannel) ? 0 : 1;
+
+        if ($isArchived || ! $hasChannel) {
+            $this->filteredItemIds[] = $wrapper->getId();
+            return;
+        }
 
         // menus table has no category_id column; relationship lives in menu_categories pivot
         DB::table('menus')->upsert(
@@ -384,7 +397,7 @@ class CatalogMapper
                 'menu_name'        => $data->getName() ?? 'Unnamed Item',
                 'menu_description' => $data->getDescription() ?? '',
                 'menu_price'       => $masterPrice,
-                'menu_status'      => $menuStatus,
+                'menu_status'      => 1,
                 'updated_at'       => now(),
             ],
             uniqueBy: ['square_object_id'],
@@ -398,13 +411,7 @@ class CatalogMapper
             ->value('menu_id');
 
         if ($menuId) {
-            if ($menuStatus === 1) {
-                $this->syncItemCategories($menuId, $data->getCategories() ?? []);
-            } else {
-                // POS-only or archived — remove from all category sections so those
-                // sections don't appear as non-empty in the storefront nav.
-                DB::table('menu_categories')->where('menu_id', $menuId)->delete();
-            }
+            $this->syncItemCategories($menuId, $data->getCategories() ?? []);
         }
 
         if (count($variations) > 1 && $menuId) {
@@ -786,42 +793,61 @@ class CatalogMapper
     // ------------------------------------------------------------------
 
     /**
-     * Deactivate menu items whose Square-synced categories are all inactive.
-     * Called once after the full item pass so that items in POS-only category
-     * trees (status=0) are also hidden from the storefront.
-     * Items belonging to at least one active category are left as-is.
+     * Hard-delete Square-synced menu rows (and all related data) by Square item ID.
+     * Used for items that failed the channel filter, are archived, or were removed
+     * from the Square catalog entirely.
+     *
+     * @param  string[]  $squareIds
      */
-    public function deactivateItemsInInactiveCategories(): void
+    public function purgeItems(array $squareIds): int
     {
-        // Find menu IDs that ONLY link to inactive Square-synced categories.
-        // Menus with at least one active-category link are excluded.
-        DB::statement("
-            UPDATE menus
-            SET    menu_status = 0,
-                   updated_at  = NOW()
-            WHERE  menu_id IN (
-                       SELECT mc.menu_id
-                       FROM   menu_categories mc
-                       JOIN   categories c ON c.category_id = mc.category_id
-                       WHERE  c.status = 0
-                         AND  c.square_object_id IS NOT NULL
-                   )
-              AND  menu_id NOT IN (
-                       SELECT mc.menu_id
-                       FROM   menu_categories mc
-                       JOIN   categories c ON c.category_id = mc.category_id
-                       WHERE  c.status = 1
-                   )
-              AND  square_object_id IS NOT NULL
-        ");
+        if (empty($squareIds)) {
+            return 0;
+        }
 
-        // Remove pivot rows for those now-inactive items
-        DB::statement("
-            DELETE mc FROM menu_categories mc
-            JOIN   menus m ON m.menu_id = mc.menu_id
-            WHERE  m.menu_status = 0
-              AND  m.square_object_id IS NOT NULL
-        ");
+        $rows = DB::table('menus')
+            ->whereIn('square_object_id', $squareIds)
+            ->get(['menu_id', 'square_object_id']);
+
+        if ($rows->isEmpty()) {
+            return 0;
+        }
+
+        $menuIds    = $rows->pluck('menu_id')->all();
+        $itemSqIds  = $rows->pluck('square_object_id')->all();
+
+        // Square-synced media attachments
+        DB::table('media_attachments')
+            ->where('attachment_type', 'Igniter\Cart\Models\Menu')
+            ->whereIn('attachment_id', $menuIds)
+            ->delete();
+
+        // Modifier-list pivot
+        DB::table('menu_item_options')
+            ->whereIn('menu_id', $menuIds)
+            ->delete();
+
+        // Synthetic variation option groups (var_option_{squareId}) and their values
+        $varOptionSquareIds = array_map(fn($id) => 'var_option_' . $id, $itemSqIds);
+        $varOptionIds = DB::table('menu_options')
+            ->whereIn('square_object_id', $varOptionSquareIds)
+            ->pluck('option_id')
+            ->all();
+
+        if (! empty($varOptionIds)) {
+            DB::table('menu_option_values')->whereIn('option_id', $varOptionIds)->delete();
+            DB::table('menu_options')->whereIn('option_id', $varOptionIds)->delete();
+        }
+
+        // Category pivot
+        DB::table('menu_categories')->whereIn('menu_id', $menuIds)->delete();
+
+        // Menu rows
+        DB::table('menus')->whereIn('menu_id', $menuIds)->delete();
+
+        SyncLog::info('Purged Square items', ['count' => count($menuIds)]);
+
+        return count($menuIds);
     }
 
     // ------------------------------------------------------------------

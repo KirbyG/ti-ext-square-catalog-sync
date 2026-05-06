@@ -10,6 +10,7 @@ use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Kirbygo\SquareCatalogSync\Models\Settings;
 use Kirbygo\SquareCatalogSync\Models\SyncLog;
 use Kirbygo\SquareCatalogSync\Services\CatalogFetcher;
@@ -114,10 +115,29 @@ class SyncSquareCatalog implements ShouldQueue
             }
         }
 
-        // Pass 4: deactivate items whose Square-synced categories are all inactive.
-        // Handles category-level channel restrictions (e.g. a POS-only section whose
-        // items still carry the online channel individually).
-        $mapper->deactivateItemsInInactiveCategories();
+        // Pass 4: hard-delete items that failed the channel/archived filter this run.
+        $mapper->purgeItems($mapper->getFilteredItemIds());
+
+        // Pass 5 (full sync only): hard-delete any square-synced item no longer in
+        // the catalog (deleted from Square since the last sync).
+        if (! $this->afterVersion) {
+            $seenItemSquareIds = array_map(
+                fn ($o) => $o->getValue()->getId(),
+                array_filter($allObjects, fn ($o) => $o->getType() === 'ITEM'),
+            );
+
+            if (! empty($seenItemSquareIds)) {
+                $staleIds = DB::table('menus')
+                    ->whereNotNull('square_object_id')
+                    ->whereNotIn('square_object_id', $seenItemSquareIds)
+                    ->pluck('square_object_id')
+                    ->all();
+
+                if (! empty($staleIds)) {
+                    $mapper->purgeItems($staleIds);
+                }
+            }
+        }
 
         if ($this->afterVersion) {
             Settings::setLastSyncVersion((string) ((int) $this->afterVersion + 1));
