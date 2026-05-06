@@ -7,6 +7,7 @@ namespace Kirbygo\SquareCatalogSync\Services;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
 use Kirbygo\SquareCatalogSync\Models\Settings;
 use Kirbygo\SquareCatalogSync\Models\SyncLog;
 use Square\Types\CatalogObject;
@@ -212,6 +213,23 @@ class CatalogMapper
                 ->update(['status' => 0, 'updated_at' => now()]);
         }
 
+        // Populate permalink_slug for newly-inserted rows that don't have one yet.
+        // We never overwrite an existing slug (stable URLs after first sync).
+        $slugsInUse = DB::table('categories')->whereNotNull('permalink_slug')->pluck('permalink_slug')->flip();
+        DB::table('categories')
+            ->whereNull('permalink_slug')
+            ->whereIn('square_object_id', array_keys($processed))
+            ->get(['category_id', 'name'])
+            ->each(function (object $row) use (&$slugsInUse): void {
+                $base = Str::slug($row->name);
+                $slug = $base;
+                for ($i = 1; $slugsInUse->has($slug); $i++) {
+                    $slug = $base . '-' . $i;
+                }
+                DB::table('categories')->where('category_id', $row->category_id)->update(['permalink_slug' => $slug]);
+                $slugsInUse->put($slug, true);
+            });
+
         // Rebuild the nested set (nest_left / nest_right) from parent_id values.
         // Must be called after all category rows are committed.
         \Igniter\Cart\Models\Category::fixTree();
@@ -366,7 +384,13 @@ class CatalogMapper
             ->value('menu_id');
 
         if ($menuId) {
-            $this->syncItemCategories($menuId, $data->getCategories() ?? []);
+            if ($menuStatus === 1) {
+                $this->syncItemCategories($menuId, $data->getCategories() ?? []);
+            } else {
+                // POS-only or archived — remove from all category sections so those
+                // sections don't appear as non-empty in the storefront nav.
+                DB::table('menu_categories')->where('menu_id', $menuId)->delete();
+            }
         }
 
         if (count($variations) > 1 && $menuId) {
